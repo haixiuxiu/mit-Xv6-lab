@@ -5,6 +5,11 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "fcntl.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
+#include "fcntl.h"
 
 struct spinlock tickslock;
 uint ticks;
@@ -29,6 +34,104 @@ trapinithart(void)
   w_stvec((uint64)kernelvec);
 }
 
+void page_fault_handler() {
+  struct proc *p = myproc();
+  // 检查 va 合法性
+  uint64 va = r_stval();
+  if (va >= p->sz || va < PGROUNDDOWN(p->trapframe->sp)) {
+    p->killed = 1;
+    return;
+  }
+  va = PGROUNDDOWN(va);
+  // 遍历 vma pool，判断 va 是否是被 mmapp 的
+  struct VMA *vma = 0;
+  for (int i = 0; i < MAX_VMA_POOL; i++) {
+    vma = p->vma_pool + i;
+    if (vma->used == 1 && (va >= vma->addr) && (va < (vma->addr + vma->length))) {
+      break;
+    }
+  }
+  // 如果 `vma` 不为 0，说明 va 是被 mmap 的，需要为其分配物理内存
+  if (vma != 0) {
+    // 先分配物理内存
+    char *kmem = kalloc();
+    if (kmem == 0) {
+      p->killed = 1;
+      return;
+    }
+    memset(kmem, 0, PGSIZE); 
+    // 将 va -> kmem 的映射加入到 pagetable 中
+    if (mappages(p->pagetable, va, PGSIZE, (uint64) kmem, (vma->prot << 1) | PTE_U) != 0) { 
+      kfree(kmem);
+      p->killed = 1;
+      return;
+    }
+    // 将映射文件的数据读入 kmem page 中
+    ilock(vma->f->ip);
+    readi(vma->f->ip, 0, (uint64) kmem, va - vma->addr, PGSIZE);
+    iunlock(vma->f->ip);
+  }
+}
+
+
+/**
+ * @brief mmap_handler 处理mmap惰性分配导致的页面错误
+ * @param va 页面故障虚拟地址
+ * @param cause 页面故障原因
+ * @return 0成功，-1失败
+ */
+int mmap_handler(int va, int cause) {
+  int i;
+  struct proc* p = myproc();
+  // 根据地址查找属于哪一个VMA
+  for(i = 0; i < MAX_VMA_POOL; ++i) {
+    if(p->vma_pool[i].used && p->vma_pool[i].addr <= va && va <= p->vma_pool[i].addr + p->vma_pool[i].length - 1) {
+      break;
+    }
+  }
+  if(i == MAX_VMA_POOL)
+    return -1;
+
+  int pte_flags = PTE_U;
+  if(p->vma_pool[i].prot & PROT_READ) pte_flags |= PTE_R;
+  if(p->vma_pool[i].prot & PROT_WRITE) pte_flags |= PTE_W;
+  if(p->vma_pool[i].prot & PROT_EXEC) pte_flags |= PTE_X;
+
+
+  struct file* vf = p->vma_pool[i].f;
+  // 读导致的页面错误
+  if(cause == 13 && vf->readable == 0) return -1;
+  // 写导致的页面错误
+  if(cause == 15 && vf->writable == 0) return -1;
+
+  void* pa = kalloc();
+  if(pa == 0)
+    return -1;
+  memset(pa, 0, PGSIZE);
+
+  // 读取文件内容
+  ilock(vf->ip);
+  // 计算当前页面读取文件的偏移量，实验中p->vma[i].offset总是0
+  // 要按顺序读读取，例如内存页面A,B和文件块a,b
+  // 则A读取a，B读取b，而不能A读取b，B读取a
+  int offset = p->vma_pool[i].offset + PGROUNDDOWN(va - p->vma_pool[i].addr);
+  int readbytes = readi(vf->ip, 0, (uint64)pa, offset, PGSIZE);
+  // 什么都没有读到
+  if(readbytes == 0) {
+    iunlock(vf->ip);
+    kfree(pa);
+    return -1;
+  }
+  iunlock(vf->ip);
+
+  // 添加页面映射
+  if(mappages(p->pagetable, PGROUNDDOWN(va), PGSIZE, (uint64)pa, pte_flags) != 0) {
+    kfree(pa);
+    return -1;
+  }
+
+  return 0;
+}
 //
 // handle an interrupt, exception, or system call from user space.
 // called from trampoline.S
@@ -65,7 +168,18 @@ usertrap(void)
     intr_on();
 
     syscall();
-  } else if((which_dev = devintr()) != 0){
+  } else if(r_scause()==13||r_scause()==15)
+  {
+    #ifdef LAB_MMAP
+    // 读取产生页面故障的虚拟地址，并判断是否位于有效区间
+    uint64 fault_va = r_stval();
+    if(PGROUNDUP(p->trapframe->sp) - 1 < fault_va && fault_va < p->sz) {
+      if(mmap_handler(r_stval(), r_scause()) != 0) p->killed = 1;
+    } else
+      p->killed = 1;
+#endif
+  }
+  else if((which_dev = devintr()) != 0){
     // ok
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
